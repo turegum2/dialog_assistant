@@ -1,51 +1,84 @@
-import os, uuid, logging
+import os, uuid, asyncio, time
+from io import BytesIO
 from typing import Dict, List
-
-import openai
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import openai
+from openai import AsyncOpenAI
 from promts import MEETING_SUMMARY_PROMPT
 
-openai.api_key = os.getenv('OPENAI_API_KEY')
-logger = logging.getLogger('dialogue-backend')
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+# ──────────────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not задан в переменных окружения")
+openai.api_key = OPENAI_API_KEY
+oclient = AsyncOpenAI()
 
-app = FastAPI()
-conversations: Dict[str, List[str]] = {}
+app = FastAPI(title="Dialog Assistant API")
 
-# ---------- helpers ---------- #
-async def transcribe(file: UploadFile) -> str:
-    audio = await file.read()
-    r = await openai.AsyncClient().audio.transcriptions.create(
-        file=audio, model='whisper-1', language='ru')
-    return r.text
+# ─── Память о диалогах ────────────────────────────────────────────────────────
+TRANSCRIPTS: Dict[str, List[str]] = {}      # session_id -> list[str]
+TOUCH: Dict[str, float] = {}                # время последнего обращения
+TTL = 60 * 60 * 24                          # 24 ч
 
-async def summarize(text: str) -> str:
-    r = await openai.AsyncClient().chat.completions.create(
-        model='gpt-4o',
-        messages=[
-            {"role":"system","content":MEETING_SUMMARY_PROMPT},
-            {"role":"user","content":text}
-        ],
-        max_tokens=700)
-    return r.choices[0].message.content.strip()
+def touch(session_id: str) -> None:
+    TOUCH[session_id] = time.time()
 
-# ---------- routes ---------- #
-@app.post('/process_audio')
-async def process_audio(file: UploadFile = File(...), session_id: str = Form(...)):
-    text = await transcribe(file)
-    conversations.setdefault(session_id, []).append(text)
-    return JSONResponse({'transcription': text})
+async def gc_sessions() -> None:
+    """Периодически вычищаем простоявшие > TTL."""
+    while True:
+        now = time.time()
+        for sid in list(TOUCH):
+            if now - TOUCH[sid] > TTL:
+                TRANSCRIPTS.pop(sid, None)
+                TOUCH.pop(sid, None)
+        await asyncio.sleep(3600)
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(gc_sessions())
 
-class SessionBody(BaseModel):
-    session_id: str
+# ─── Эндпоинт 1. Транскрипция ────────────────────────────────────────────────
+@app.post("/process_audio")
+async def process_audio(file: UploadFile = File(...),
+                        session_id: str = Form(...)):
+    try:
+        touch(session_id)
+        audio_bytes = BytesIO(await file.read())
+        audio_bytes.name = file.filename                       # ← нужно Whisper-1
 
-@app.post('/get_summary')
-async def get_summary(body: SessionBody):
-    sess = body.session_id
-    if sess not in conversations or not conversations[sess]:
-        return JSONResponse({'summary': 'Нет данных для суммирования.'})
-    full = '\n'.join(conversations[sess])
-    summary = await summarize(full)
-    return JSONResponse({'summary': summary})
+        tr = await oclient.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_bytes,
+            language="ru"
+        )
+        text = tr.text.strip()
+
+        TRANSCRIPTS.setdefault(session_id, []).append(text)
+        return {"transcription": text}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ─── Эндпоинт 2. Итоговое резюме ─────────────────────────────────────────────
+@app.post("/get_meeting_summary")
+async def get_meeting_summary(session_id: str = Form(...)):
+    if session_id not in TRANSCRIPTS:
+        return {"summary": "Транскрипции отсутствуют."}
+
+    full_dialogue = "\n".join(TRANSCRIPTS[session_id])
+    prompt = (MEETING_SUMMARY_PROMPT +
+              "\n\n---\n\nТранскрипция встречи (без изменений):\n" +
+              full_dialogue)
+
+    try:
+        chat = await oclient.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Ты – опытный секретарь-резюмировщик."},
+                {"role": "user",   "content": prompt}
+            ],
+            temperature=0.4
+        )
+        summary = chat.choices[0].message.content.strip()
+        return {"summary": summary}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
